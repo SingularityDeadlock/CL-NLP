@@ -1,0 +1,47 @@
+import numpy as np
+import pandas as pd
+from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import normalize
+
+from build_corpus import MODEL_NAME, load_pairs
+
+N_EVAL = 1000
+TARGETS = ["es", "fr", "de", "hi"]
+
+
+def metrics(sim):
+    correct = np.diag(sim)
+    rank = (sim > correct[:, None]).sum(axis=1) 
+    return {
+        "Top-1": float((rank < 1).mean()),
+        "Top-5": float((rank < 5).mean()),
+        "Top-10": float((rank < 10).mean()),
+        "MRR": float((1.0 / (rank + 1)).mean()),
+    }
+
+
+def tfidf_sim(queries, docs):
+    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), sublinear_tf=True)
+    vec.fit(queries + docs)
+    q, d = vec.transform(queries), vec.transform(docs)
+    return (q @ d.T).toarray()
+
+
+if __name__ == "__main__":
+    model = SentenceTransformer(MODEL_NAME)
+    rows = []
+    for tgt in TARGETS:
+        pairs = load_pairs("en", tgt, N_EVAL)
+        en = [p[0] for p in pairs]
+        xx = [p[1] for p in pairs]
+        print(f"en -> {tgt}: {len(pairs)} pairs")
+
+        q = model.encode(en, normalize_embeddings=True, batch_size=64)
+        d = model.encode(xx, normalize_embeddings=True, batch_size=64)
+        rows.append({"Direction": f"en->{tgt}", "Method": "Multilingual embeddings", **metrics(q @ d.T)})
+        rows.append({"Direction": f"en->{tgt}", "Method": "TF-IDF baseline", **metrics(tfidf_sim(en, xx))})
+
+    res = pd.DataFrame(rows).round(3)
+    res.to_csv("results.csv", index=False)
+    print(res.to_string(index=False))

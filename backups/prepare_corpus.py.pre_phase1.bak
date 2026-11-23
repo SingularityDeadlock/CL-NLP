@@ -1,0 +1,65 @@
+
+import numpy as np
+import pandas as pd
+from datasets import load_dataset
+from sentence_transformers import SentenceTransformer
+
+MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+N_PAIRS = 1000
+
+LANGUAGES = {
+    "en-de": ("English", "German"),
+    "en-es": ("English", "Spanish"),
+    "en-fr": ("English", "French"),
+    "en-hi": ("English", "Hindi"),
+}
+
+rows = []
+
+for config, (en_name, target_name) in LANGUAGES.items():
+    print(f"Loading Tatoeba: {config}")
+
+    dataset = load_dataset(
+        "sentence-transformers/parallel-sentences-tatoeba",
+        config,
+        split=f"train[:{N_PAIRS}]"
+    )
+
+    print("Columns:", dataset.column_names)
+
+    for item in dataset:
+        # Confirm column names from the printed output if needed.
+        english = item.get("english")
+        translated = item.get("non_english")
+
+        if english and translated:
+            rows.append({
+                "language": en_name,
+                "sentence": english.strip()
+            })
+            rows.append({
+                "language": target_name,
+                "sentence": translated.strip()
+            })
+
+df = pd.DataFrame(rows)
+df["sentence"] = df["sentence"].fillna("").str.strip()
+df = df[df["sentence"].str.split().str.len() >= 4]
+df = df.drop_duplicates(subset=["sentence"]).reset_index(drop=True)
+
+if df.empty:
+    raise ValueError("No sentences loaded. Check the dataset column names.")
+
+df.to_csv("corpus.csv", index=False)
+
+print(f"Saving embeddings for {len(df)} sentences...")
+model = SentenceTransformer(MODEL_NAME)
+embeddings = model.encode(
+    df["sentence"].tolist(),
+    normalize_embeddings=True,
+    batch_size=64,
+    show_progress_bar=True
+)
+np.save("embeddings.npy", embeddings)
+
+print("Done! corpus.csv and embeddings.npy updated.")

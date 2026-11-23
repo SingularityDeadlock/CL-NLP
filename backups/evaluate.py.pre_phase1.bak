@@ -1,0 +1,347 @@
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from sentence_transformers import SentenceTransformer
+
+from corpus_utils import (
+    CORPUS_PAIRS,
+    DATASET_NAME,
+    DEFAULT_N_EVAL,
+    LANGUAGE_NAMES,
+    MODEL_NAME,
+    TARGET_LANGUAGE_CODES,
+    encode_texts,
+    indexed_sentence_set,
+    load_heldout_pairs,
+    load_indexed_corpus,
+    retrieval_metrics,
+    retrieval_ranks,
+    tfidf_scores,
+)
+
+EMBEDDING_METHOD = "Multilingual embeddings"
+TFIDF_METHOD = "TF-IDF baseline"
+
+
+def configure_stdout() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+
+def build_query_rows(
+    *,
+    direction: str,
+    method: str,
+    pairs,
+    queries,
+    references,
+    scores: np.ndarray,
+    ranks: np.ndarray,
+    corpus_sentences: set[str],
+    query_lang: str,
+    target_lang: str,
+) -> list[dict]:
+    rows = []
+    for i, (pair, query, reference, rank) in enumerate(
+        zip(pairs, queries, references, ranks)
+    ):
+        rows.append(
+            {
+                "direction": direction,
+                "method": method,
+                "pair_id": pair.pair_id,
+                "dataset_index": pair.dataset_index,
+                "query_language": LANGUAGE_NAMES[query_lang],
+                "target_language": LANGUAGE_NAMES[target_lang],
+                "query": query,
+                "reference": reference,
+                "reference_in_eval_candidates": True,
+                "reference_in_indexed_corpus": bool(reference in corpus_sentences),
+                "query_in_indexed_corpus": bool(query in corpus_sentences),
+                "rank": float(rank),
+                "indexed_corpus_rank": np.nan,
+                "candidate_pool_size": len(references),
+                "correct_similarity": float(scores[i, i]),
+                "reciprocal_rank": float(1.0 / rank),
+                "ndcg@10": float(1.0 / np.log2(rank + 1.0)) if rank <= 10 else 0.0,
+                "top1": bool(rank <= 1),
+                "recall@5": bool(rank <= 5),
+                "recall@10": bool(rank <= 10),
+            }
+        )
+    return rows
+
+
+def summary_row(
+    *,
+    direction: str,
+    method: str,
+    ranks: np.ndarray,
+    candidate_pool_size: int,
+    references_in_corpus: int,
+) -> dict:
+    return {
+        "Direction": direction,
+        "Method": method,
+        "N": len(ranks),
+        "Candidate pool": candidate_pool_size,
+        "Reference in indexed corpus": references_in_corpus,
+        **retrieval_metrics(ranks),
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Held-out cross-lingual retrieval evaluation."
+    )
+    parser.add_argument(
+        "--corpus",
+        default="corpus.csv",
+        help="Indexed corpus CSV used for the leakage/coverage check.",
+    )
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=DEFAULT_N_EVAL,
+        help="Number of held-out pairs per language.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        default=".",
+        help="Directory for results.csv, results_per_query.csv, and eval_pairs.csv.",
+    )
+    args = parser.parse_args()
+
+    configure_stdout()
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    corpus_df = load_indexed_corpus(args.corpus)
+    corpus_sentences = indexed_sentence_set(corpus_df)
+
+    print("Held-out cross-lingual retrieval evaluation")
+    print(f"Embedding model: {MODEL_NAME}")
+    print(f"Indexed corpus: {len(corpus_df):,} sentences from {args.corpus}")
+    print(f"Held-out data: {DATASET_NAME} train[{CORPUS_PAIRS}:...]")
+    print(f"Pairs per language: {args.n:,}")
+    print()
+
+    model = SentenceTransformer(MODEL_NAME)
+    embedding_cache: dict[str, np.ndarray] = {}
+
+    all_pairs = []
+    per_query_rows: list[dict] = []
+    summary_rows: list[dict] = []
+    coverage_rows: list[dict] = []
+
+    for target_lang in TARGET_LANGUAGE_CODES:
+        pairs, stats = load_heldout_pairs(
+            target_lang,
+            n=args.n,
+            exclude=corpus_sentences,
+        )
+        print(
+            f"en-{target_lang}: kept {len(pairs):,} held-out pairs "
+            f"(scanned {stats.loaded:,}; skipped "
+            f"{stats.skipped_corpus_overlap:,} corpus overlaps, "
+            f"{stats.skipped_duplicate:,} duplicates, "
+            f"{stats.skipped_short:,} short, "
+            f"{stats.skipped_empty:,} empty)"
+        )
+        if not pairs:
+            continue
+
+        all_pairs.extend(pairs)
+
+        directions = [
+            (
+                f"en->{target_lang}",
+                "en",
+                target_lang,
+                [pair.source for pair in pairs],
+                [pair.target for pair in pairs],
+            ),
+            (
+                f"{target_lang}->en",
+                target_lang,
+                "en",
+                [pair.target for pair in pairs],
+                [pair.source for pair in pairs],
+            ),
+        ]
+
+        for direction, query_lang, doc_lang, queries, documents in directions:
+            references = documents
+            references_in_corpus = sum(
+                1 for reference in references if reference in corpus_sentences
+            )
+            coverage_rows.append(
+                {
+                    "direction": direction,
+                    "queries": len(queries),
+                    "reference_in_indexed_corpus": references_in_corpus,
+                    "reference_in_indexed_corpus_pct": (
+                        100.0 * references_in_corpus / len(queries)
+                    ),
+                }
+            )
+
+            query_embeddings = encode_texts(model, queries, cache=embedding_cache)
+            document_embeddings = encode_texts(
+                model, documents, cache=embedding_cache
+            )
+            embedding_scores = query_embeddings @ document_embeddings.T
+            embedding_ranks = retrieval_ranks(embedding_scores)
+
+            per_query_rows.extend(
+                build_query_rows(
+                    direction=direction,
+                    method=EMBEDDING_METHOD,
+                    pairs=pairs,
+                    queries=queries,
+                    references=references,
+                    scores=embedding_scores,
+                    ranks=embedding_ranks,
+                    corpus_sentences=corpus_sentences,
+                    query_lang=query_lang,
+                    target_lang=doc_lang,
+                )
+            )
+            summary_rows.append(
+                summary_row(
+                    direction=direction,
+                    method=EMBEDDING_METHOD,
+                    ranks=embedding_ranks,
+                    candidate_pool_size=len(documents),
+                    references_in_corpus=references_in_corpus,
+                )
+            )
+
+            tfidf_matrix = tfidf_scores(queries, documents)
+            tfidf_ranks = retrieval_ranks(tfidf_matrix)
+
+            per_query_rows.extend(
+                build_query_rows(
+                    direction=direction,
+                    method=TFIDF_METHOD,
+                    pairs=pairs,
+                    queries=queries,
+                    references=references,
+                    scores=tfidf_matrix,
+                    ranks=tfidf_ranks,
+                    corpus_sentences=corpus_sentences,
+                    query_lang=query_lang,
+                    target_lang=doc_lang,
+                )
+            )
+            summary_rows.append(
+                summary_row(
+                    direction=direction,
+                    method=TFIDF_METHOD,
+                    ranks=tfidf_ranks,
+                    candidate_pool_size=len(documents),
+                    references_in_corpus=references_in_corpus,
+                )
+            )
+
+            print(
+                f"  {direction}: {len(queries):,} queries; "
+                f"reference in indexed corpus: {references_in_corpus:,}"
+                f"/{len(queries):,} "
+                f"({100.0 * references_in_corpus / len(queries):.1f}%)"
+            )
+
+    if not per_query_rows:
+        raise RuntimeError("No held-out pairs were loaded; nothing to evaluate.")
+
+    per_query_df = pd.DataFrame(per_query_rows)
+    summary_df = pd.DataFrame(summary_rows)
+
+    all_references_in_corpus = sum(
+        1 for pair in all_pairs if pair.target in corpus_sentences
+    ) + sum(1 for pair in all_pairs if pair.source in corpus_sentences)
+
+    aggregate_rows = []
+    for method in (EMBEDDING_METHOD, TFIDF_METHOD):
+        method_rows = per_query_df[per_query_df["method"] == method]
+        aggregate_rows.append(
+            {
+                "Direction": "ALL",
+                "Method": method,
+                "N": len(method_rows),
+                "Candidate pool": np.nan,
+                "Reference in indexed corpus": all_references_in_corpus,
+                **retrieval_metrics(method_rows["rank"].to_numpy()),
+            }
+        )
+
+    summary_df = pd.concat(
+        [summary_df, pd.DataFrame(aggregate_rows)], ignore_index=True
+    )
+
+    per_query_df.to_csv(
+        out_dir / "results_per_query.csv", index=False, encoding="utf-8-sig"
+    )
+    summary_df.to_csv(
+        out_dir / "results.csv", index=False, encoding="utf-8-sig"
+    )
+    pd.DataFrame(
+        [
+            {
+                "pair_id": pair.pair_id,
+                "config": pair.config,
+                "dataset_index": pair.dataset_index,
+                "source_language": LANGUAGE_NAMES[pair.source_lang],
+                "target_language": LANGUAGE_NAMES[pair.target_lang],
+                "source": pair.source,
+                "target": pair.target,
+                "source_in_indexed_corpus": pair.source in corpus_sentences,
+                "target_in_indexed_corpus": pair.target in corpus_sentences,
+            }
+            for pair in all_pairs
+        ]
+    ).to_csv(out_dir / "eval_pairs.csv", index=False, encoding="utf-8-sig")
+
+    display_columns = [
+        "Direction",
+        "Method",
+        "N",
+        "Recall@1",
+        "Recall@5",
+        "Recall@10",
+        "MRR",
+        "nDCG@10",
+        "Top-1",
+        "Top-5",
+        "Reference in indexed corpus",
+    ]
+
+    total_reference_checks = 2 * len(all_pairs)
+    print()
+    print(
+        f"Held-out reference checks: {total_reference_checks:,}; "
+        f"found in indexed corpus: {all_references_in_corpus:,} "
+        f"({100.0 * all_references_in_corpus / total_reference_checks:.2f}%)"
+    )
+    print("A held-out reference found in corpus.csv would indicate leakage.")
+    print("Ranks are average 1-based ranks among held-out candidate translations.")
+    print()
+    print("Summary (higher is better):")
+    print(summary_df[display_columns].round(3).to_string(index=False))
+    print()
+    print("Files written:")
+    print(f"  {out_dir / 'results.csv'}")
+    print(f"  {out_dir / 'results_per_query.csv'}")
+    print(f"  {out_dir / 'eval_pairs.csv'}")
+
+
+if __name__ == "__main__":
+    main()
